@@ -1,11 +1,12 @@
-import {
-  TextractClient,
-  StartDocumentTextDetectionCommand,
-} from "@aws-sdk/client-textract";
-import { fromIni } from "@aws-sdk/credential-providers";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
+import {
+  Entity,
+  SentimentScore,
+  SentimentType,
+} from "aws-sdk/clients/comprehend";
+import { IAnalysisResponse } from "../config/interface";
 
 dotenv.config();
 
@@ -15,20 +16,11 @@ AWS.config.update({
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   region: process.env.AWS_REGION,
 });
-
-const profileName = process.env.AWS_PROFILE_NAME || "default";
-const region = process.env.AWS_REGION || "us-east-1";
-const snsTopicArn = process.env.SNS_TOPIC_ARN as string;
-const roleArn = process.env.ROLE_ARN as string;
 const bucketName = process.env.S3_BUCKET as string;
-
-const textractClient = new TextractClient({
-  region,
-  credentials: fromIni({ profile: profileName }),
-});
 
 const s3 = new AWS.S3();
 const textract = new AWS.Textract();
+const comprehend = new AWS.Comprehend();
 
 const uploadToS3 = async (file: Express.Multer.File): Promise<string> => {
   const fileKey = `uploads/${uuidv4()}-${file.originalname}`;
@@ -47,21 +39,24 @@ export const processDocument = async (file: Express.Multer.File) => {
     const documentKey = await uploadToS3(file);
     console.log("Uploaded document to S3:", documentKey);
 
-    const response = await textractClient.send(
-      new StartDocumentTextDetectionCommand({
+    const response = await textract
+      .startDocumentTextDetection({
         DocumentLocation: {
           S3Object: { Bucket: bucketName, Name: documentKey },
         },
-        NotificationChannel: { RoleArn: roleArn, SNSTopicArn: snsTopicArn },
       })
-    );
-
+      .promise();
     console.log("Processing started, Job ID:", response.JobId);
 
     if (!response.JobId) throw new Error("Failed to start Textract job");
 
     const extractedText = await waitForJobCompletion(response.JobId);
-    return extractedText;
+    const textAnalysis = await analyzeText(extractedText as string);
+    return {
+      extractedText : extractedText?.trim(),
+      sentiment: textAnalysis?.sentiment,
+      entites: textAnalysis?.entities,
+    };
   } catch (err) {
     console.error("Error processing document:", err);
     throw err;
@@ -93,7 +88,6 @@ const waitForJobCompletion = async (
   while (!jobCompleted) {
     try {
       const { extractedText, status } = await getExtractedText(jobId);
-
       if (status === "SUCCEEDED") {
         jobCompleted = true;
         return extractedText;
@@ -103,3 +97,42 @@ const waitForJobCompletion = async (
     }
   }
 };
+
+async function analyzeText(text: string) {
+  try {
+    const response = {
+      sentiment: { sentiment: "", score: {} },
+      entities: [],
+    } as IAnalysisResponse;
+    // Detect Sentiment
+    const sentimentResult = await comprehend
+      .detectSentiment({
+        Text: text,
+        LanguageCode: "en",
+      })
+      .promise();
+    response.sentiment.sentiment = sentimentResult.Sentiment as SentimentType;
+    response.sentiment.score = sentimentResult.SentimentScore as SentimentScore;
+    // Detect Entities (NER)
+    const entitiesResult = await comprehend
+      .detectEntities({
+        Text: text,
+        LanguageCode: "en",
+      })
+      .promise();
+    if (entitiesResult.Entities) {
+      entitiesResult.Entities.forEach((entity: Entity, index: number) => {
+        response.entities[index] = {
+          text: entity.Text as string,
+          type: entity.Type as string,
+          score: entity.Score?.toFixed(2) || ("0.00" as string),
+        };
+      });
+    } else {
+      console.warn("No entities detected in the text.");
+    }
+    return response;
+  } catch (err) {
+    console.error("Error analyzing text:", err);
+  }
+}
